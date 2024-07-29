@@ -20,9 +20,6 @@ fw_adapter_sequence: "CTGTCTCTTATACACATCT"
 rv_adapter_sequence: "CTGTCTCTTATACACATCT"
 run_fastq_qc: True
 
-### 2. BWA mapping
-bwa_options: ''
-
 
 ### 2. BAM filtering
 MAPQ_threshold: 30
