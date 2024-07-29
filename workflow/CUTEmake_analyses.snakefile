@@ -485,7 +485,7 @@ rule peakCalling_GoPeaks:
         sample_config_table = config["workflow_configuration"]["sample_config_table"],
         input_suffix = "_mapq"+MAPQ+"_woMT_shifted_sorted.bam",
         genomeSize = config["genomic_annotations"]["effective_genomeSize"],
-        gopeaks_qValue_cutoff = config["peak_calling"]["GoPeaks_pValue_cutoff"],
+        gopeaks_pValue_cutoff = config["peak_calling"]["GoPeaks_pValue_cutoff"],
         blacklist = BLACKLIST
     threads:
         max(math.floor(workflow.cores/len(TARGETNAMES)), 1)
@@ -515,7 +515,7 @@ rule peakCalling_GoPeaks:
             --bam {input.target_bam} \
             --chromsize {input.chrSizes} \
             --mdist $MDIST \
-            --pval {params.gopeaks_qValue_cutoff} \
+            --pval {params.gopeaks_pValue_cutoff} \
             --prefix 05_GoPeaks_peaks/{params.sample}.filtered.BAMPE ${{BROAD}} > {log.err} 2> {log.out}
         else
             $CONDA_PREFIX/bin/gopeaks \
@@ -523,7 +523,7 @@ rule peakCalling_GoPeaks:
             --control 01_BAM_filtered/shifted/${{INPUT_ID}}{params.input_suffix} \
             --chromsize {input.chrSizes} \
             --mdist $MDIST \
-            --pval {params.gopeaks_qValue_cutoff} \
+            --pval {params.gopeaks_pValue_cutoff} \
             --prefix 05_GoPeaks_peaks/{params.sample}.filtered.BAMPE ${{BROAD}} > {log.err} 2> {log.out}
         fi
 
