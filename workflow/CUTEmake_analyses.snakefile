@@ -119,7 +119,7 @@ genome_fai = ''.join([genome_fasta, ".fai"])
 BLACKLIST_HARMONIZED = os.path.join(ANNOTATIONDIR, "blacklist_harmonized.bed")
 GREENLIST_HARMONIZED = os.path.join(ANNOTATIONDIR, "greenlist_harmonized.bed")
 MACS_RATIO_TABLE = os.path.join(GREENLISTDIR, "MACS3_ratio_per_target.tsv")
-GREENLIST_SIZE_FACTORS = os.path.join(GREENLISTDIR, "greenlist_sizeFactors.tsv")
+GREENLIST_SIZE_FACTORS = os.path.join(GREENLISTDIR, "all_groups_greenlist_sizeFactors.tsv")
 
 
 ### Read filtering flags
@@ -137,7 +137,16 @@ else:
 # ========================================================================================
 
 sample_metadata = pd.read_csv(str(config["workflow_configuration"]["sample_config_table"]), sep='\t+', engine='python')
-sample_metadata = sample_metadata.iloc[:, 0:3].set_axis(['target_id', 'control_id', 'broad'], axis=1, copy=False)
+
+# the fourth column is optional: a table without it behaves the way the workflow did before
+# normalization groups existed, with every sample estimated against every other one
+if sample_metadata.shape[1] >= 4:
+    sample_metadata = sample_metadata.iloc[:, 0:4].set_axis(['target_id', 'control_id', 'broad', 'normalization_group'], axis=1, copy=False)
+    sample_metadata['normalization_group'] = sample_metadata['normalization_group'].astype(str).str.strip()
+    sample_metadata.loc[sample_metadata['normalization_group'].isin(['', 'nan', 'NA', 'None', '-']), 'normalization_group'] = "all_samples"
+else:
+    sample_metadata = sample_metadata.iloc[:, 0:3].set_axis(['target_id', 'control_id', 'broad'], axis=1, copy=False)
+    sample_metadata['normalization_group'] = "all_samples"
 
 sample_metadata['target_id'] = sample_metadata['target_id'].astype(str).str.strip()
 sample_metadata['control_id'] = sample_metadata['control_id'].astype(str).str.strip()
@@ -165,10 +174,45 @@ gopeaks_mode_option = {t: ("--broad" if m == "broad" else "") for t, m in peak_m
 gopeaks_mdist = {t: ("3000" if m == "broad" else "1000") for t, m in peak_mode.items()}
 
 
+### normalization groups -------------------------------------------------------------------
+# Greenlist size factors are estimated by comparing every sample to the others, so the samples
+# put together have to share a comparable background. Antibodies that cover very different
+# fractions of the genome do not, and requiring every sample of a large cohort to carry signal
+# in the same region shrinks the usable part of the greenlist very quickly. Grouping by
+# antibody addresses both, at the price of factors that are comparable within a group and not
+# across groups.
+group_of = dict(zip(sample_metadata.target_id, sample_metadata.normalization_group))
+
+invalid_groups = sorted({str(g) for g in group_of.values() if not re.fullmatch(r"[A-Za-z0-9._+-]+", str(g))})
+if len(invalid_groups) > 0:
+    sys.exit(''.join(["\033[1;31m\n!!! Invalid normalization_group name(s): ", ', '.join(invalid_groups), " !!!\n",
+                      "    Group names are used as directory names: only letters, digits, '.', '_', '+' and '-'.\n\n\033[0m"]))
+
+# a control belongs to the group of the targets it serves. MACS3 --ratio divides the size
+# factor of a target by the one of its control, and two factors coming from different groups
+# are not on a common scale, so the assignment has to be unambiguous.
+for target, control in zip(sample_metadata.target_id, sample_metadata.control_id):
+    if control == target:
+        continue
+    if control in group_of:
+        if group_of[control] != group_of[target]:
+            sys.exit(''.join(["\033[1;31m\n!!! '", str(control), "' is the control of '", str(target),
+                              "' but the two sit in different normalization groups ('", str(group_of[control]),
+                              "' and '", str(group_of[target]), "') !!!\n",
+                              "    A target and its control have to be normalized together. Either put both\n",
+                              "    targets in the same group, or give each group its own control.\n\n\033[0m"]))
+    else:
+        group_of[control] = group_of[target]
+
+GROUPS = sorted(set(group_of.values()))
+samples_in_group = {g: sorted([s for s in SAMPLENAMES if group_of[s] == g]) for g in GROUPS}
+
+
 ### generation of global wildcard_constraints
 wildcard_constraints:
     SAMPLES = constraint_to(SAMPLENAMES),
-    TARGET = constraint_to(TARGETNAMES)
+    TARGET = constraint_to(TARGETNAMES),
+    GROUP = constraint_to(GROUPS)
 
 
 # ========================================================================================
@@ -198,12 +242,16 @@ if use_greenlist:
     if greenlist_counting_method not in ["multiBamSummary", "featureCounts"]:
         sys.exit("\033[1;31m\n!!! *counting_method* must be 'multiBamSummary' or 'featureCounts' !!!\n\n\033[0m")
 
-    if greenlist_size_factor_method not in ["median_of_ratios", "total_counts"]:
-        sys.exit("\033[1;31m\n!!! *size_factor_method* must be 'median_of_ratios' or 'total_counts' !!!\n\n\033[0m")
+    if greenlist_size_factor_method not in ["median_of_ratios", "poscounts", "total_counts"]:
+        sys.exit("\033[1;31m\n!!! *size_factor_method* must be 'median_of_ratios', 'poscounts' or 'total_counts' !!!\n\n\033[0m")
 
-# size factors are estimated across the cohort, they carry no meaning when only a couple of
-# samples are available
-run_greenlist = use_greenlist and (len(SAMPLENAMES) >= greenlist_min_samples)
+# size factors are estimated within a group, so the minimum sample number applies per group
+# and not to the cohort as a whole. Groups below the minimum are skipped individually, the
+# others still run.
+greenlist_groups_run = [g for g in GROUPS if len(samples_in_group[g]) >= greenlist_min_samples] if use_greenlist else []
+greenlist_groups_skipped = [g for g in GROUPS if g not in greenlist_groups_run] if use_greenlist else []
+
+run_greenlist = use_greenlist and (len(greenlist_groups_run) > 0)
 greenlist_for_peak_calling = greenlist_for_peak_calling and run_greenlist
 
 
@@ -225,15 +273,20 @@ if (len(SAMPLENAMES) > 1):
 ### Greenlist outputs
 greenlist_outputs = []
 if run_greenlist:
-    greenlist_outputs.append(GREENLIST_SIZE_FACTORS)
-    greenlist_outputs.append(os.path.join(GREENLISTDIR, "greenlist_sizeFactors_barplot.pdf"))
-    greenlist_outputs.append(os.path.join(GREENLISTDIR, "greenlist_background_consistency_boxplot.pdf"))
     greenlist_outputs.append(os.path.join(GREENLISTDIR, "greenlist_blacklist_overlap.txt"))
-    greenlist_outputs += expand(os.path.join("03_bigWig_bamCoverage/greenlist_normalized/",
-                                             ''.join(["{sample}_mapq", MAPQ, "_greenlist.normalized_bs", BIN_SIZE, ".bw"])),
-                                sample = SAMPLENAMES)
-elif use_greenlist:
-    greenlist_outputs.append(os.path.join(GREENLISTDIR, "not_generated_due_to_low_sample_number.txt"))
+    greenlist_outputs.append(GREENLIST_SIZE_FACTORS)
+
+    for greenlist_group in greenlist_groups_run:
+        greenlist_outputs.append(os.path.join(GREENLISTDIR, greenlist_group, "greenlist_sizeFactors.tsv"))
+        greenlist_outputs.append(os.path.join(GREENLISTDIR, greenlist_group, "greenlist_sizeFactors_barplot.pdf"))
+        greenlist_outputs.append(os.path.join(GREENLISTDIR, greenlist_group, "greenlist_background_consistency_boxplot.pdf"))
+        greenlist_outputs += [os.path.join("03_bigWig_bamCoverage/greenlist_normalized/",
+                                           ''.join([greenlist_sample, "_mapq", MAPQ, "_greenlist.normalized_bs", BIN_SIZE, ".bw"]))
+                              for greenlist_sample in samples_in_group[greenlist_group]]
+
+if use_greenlist:
+    for greenlist_group in greenlist_groups_skipped:
+        greenlist_outputs.append(os.path.join(GREENLISTDIR, greenlist_group, "not_generated_due_to_low_sample_number.txt"))
 
 
 ### Chromosome remove pattern
@@ -930,34 +983,46 @@ rule RPGC_normalized_bigWig:
 # de Mello et al. 2024, Brief Bioinform 25:bbad538
 #
 # Greenlist regions carry reproducible background signal. Their read pile-up is quantified
-# for every sample, DESeq2 median-of-ratios turns the count matrix into one size factor per
-# sample, and the reciprocal of that factor scales the coverage tracks. The size factors are
-# relative to the cohort: adding or removing a sample changes them for everybody.
+# for every sample, a median-of-ratios estimator turns the count matrix into one size factor
+# per sample, and the reciprocal of that factor scales the coverage tracks.
+#
+# Size factors are estimated separately for every normalization group, the fourth column of
+# the sample table. Two reasons for that: the estimator compares each sample to the others,
+# which only means something when they share a comparable background, and the classic
+# estimator keeps only the regions covered in every sample, so a large mixed cohort shrinks
+# the usable part of the greenlist very quickly. The price is that factors are comparable
+# within a group and not across groups.
 #
 # The greenlist tracks are produced in addition to the RPGC ones, both sets stay available.
 
-if use_greenlist and not run_greenlist:
+if use_greenlist and len(greenlist_groups_skipped) > 0:
     rule greenlist_low_sample_number:
         output:
-            notice = os.path.join(GREENLISTDIR, "not_generated_due_to_low_sample_number.txt")
+            notice = os.path.join(GREENLISTDIR, "{GROUP}/not_generated_due_to_low_sample_number.txt")
         params:
-            greenlist_dir = GREENLISTDIR,
-            n_samples = len(SAMPLENAMES),
-            min_samples = greenlist_min_samples
+            group_dir = lambda wildcards: os.path.join(GREENLISTDIR, wildcards.GROUP),
+            group = "{GROUP}",
+            n_samples = lambda wildcards: len(samples_in_group[wildcards.GROUP]),
+            min_samples = greenlist_min_samples,
+            sample_list = lambda wildcards: ', '.join(samples_in_group[wildcards.GROUP])
         threads: 1
         shell:
             """
-            printf '\033[1;33mGreenlist normalization skipped: %s sample(s) available, %s required.\\n\033[0m' "{params.n_samples}" "{params.min_samples}"
+            printf '\033[1;33mGreenlist normalization skipped for group {params.group}: %s sample(s) available, %s required.\\n\033[0m' "{params.n_samples}" "{params.min_samples}"
 
-            mkdir -p {params.greenlist_dir}
+            mkdir -p {params.group_dir}
 
-            printf 'Greenlist normalization was not performed.\\n\\n' > {output.notice}
+            printf 'Greenlist normalization was not performed for the group "%s".\\n\\n' "{params.group}" > {output.notice}
+            printf 'Samples in the group: %s\\n' "{params.sample_list}" >> {output.notice}
             printf 'Samples available: %s\\n' "{params.n_samples}" >> {output.notice}
             printf 'Samples required (normalization/greenlist/min_samples): %s\\n\\n' "{params.min_samples}" >> {output.notice}
-            printf 'Greenlist size factors are estimated across the whole cohort by comparing\\n' >> {output.notice}
-            printf 'each sample to the geometric mean of all the others. Below the minimum the\\n' >> {output.notice}
-            printf 'estimate carries no information and would return factors close to 1 that\\n' >> {output.notice}
-            printf 'look meaningful but are not.\\n\\n' >> {output.notice}
+            printf 'Greenlist size factors are estimated within a normalization group by\\n' >> {output.notice}
+            printf 'comparing each sample to the geometric mean of the others in the same\\n' >> {output.notice}
+            printf 'group. Below the minimum the estimate carries no information and would\\n' >> {output.notice}
+            printf 'return factors close to 1 that look meaningful but are not.\\n\\n' >> {output.notice}
+            printf 'Either merge this group with another one in the fourth column of the\\n' >> {output.notice}
+            printf 'sample table, or lower min_samples if you know what the factors will be\\n' >> {output.notice}
+            printf 'worth.\\n\\n' >> {output.notice}
             printf 'The RPGC-normalized bigWig files in 03_bigWig_bamCoverage/RPGC_normalized/\\n' >> {output.notice}
             printf 'are unaffected and can be used as usual.\\n' >> {output.notice}
             """
@@ -968,28 +1033,29 @@ if run_greenlist:
     if greenlist_counting_method == "multiBamSummary":
         rule greenlist_counts:
             input:
-                bams = expand(os.path.join("01_BAM_filtered/shifted", ''.join(["{sample}_mapq", MAPQ, "_woMT_shifted_sorted.bam"])), sample = SAMPLENAMES),
-                bais = expand(os.path.join("01_BAM_filtered/shifted", ''.join(["{sample}_mapq", MAPQ, "_woMT_shifted_sorted.bam.bai"])), sample = SAMPLENAMES),
+                bams = lambda wildcards: [shifted_bam(s) for s in samples_in_group[wildcards.GROUP]],
+                bais = lambda wildcards: [shifted_bai(s) for s in samples_in_group[wildcards.GROUP]],
                 greenlist = GREENLIST_HARMONIZED
             output:
-                npz = os.path.join(GREENLISTDIR, "greenlist_counts_matrix.npz"),
-                raw = temp(os.path.join(GREENLISTDIR, "greenlist_raw_counts.deeptools.txt")),
-                counts = os.path.join(GREENLISTDIR, "greenlist_raw_counts.tsv")
+                npz = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_counts_matrix.npz"),
+                raw = temp(os.path.join(GREENLISTDIR, "{GROUP}/greenlist_raw_counts.deeptools.txt")),
+                counts = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_raw_counts.tsv")
             params:
-                greenlist_dir = GREENLISTDIR,
-                labels = ' '.join(SAMPLENAMES)
+                group = "{GROUP}",
+                log_dir = os.path.join(GREENLISTDIR, "{GROUP}/logs"),
+                labels = lambda wildcards: ' '.join(samples_in_group[wildcards.GROUP])
             threads:
                 max((workflow.cores - 1), 1)
             log:
-                out = os.path.join(GREENLISTDIR, "logs/greenlist_multiBamSummary.out"),
-                err = os.path.join(GREENLISTDIR, "logs/greenlist_multiBamSummary.err")
+                out = os.path.join(GREENLISTDIR, "{GROUP}/logs/greenlist_multiBamSummary.out"),
+                err = os.path.join(GREENLISTDIR, "{GROUP}/logs/greenlist_multiBamSummary.err")
             benchmark:
-                "benchmarks/greenlist_counts/greenlist_counts---multiBamSummary_benchmark.txt"
+                "benchmarks/greenlist_counts/greenlist_counts---multiBamSummary---{GROUP}_benchmark.txt"
             shell:
                 """
-                printf '\033[1;36mQuantifying the greenlist regions (multiBamSummary)...\\n\033[0m'
+                printf '\033[1;36m{params.group}: quantifying the greenlist regions (multiBamSummary)...\\n\033[0m'
 
-                mkdir -p {params.greenlist_dir}logs
+                mkdir -p {params.log_dir}
 
                 # no --blackListFileName here on purpose: greenlist regions are regions of
                 # reproducible background and some of them sit inside a blacklist, removing
@@ -1013,28 +1079,29 @@ if run_greenlist:
     else:
         rule greenlist_counts:
             input:
-                bams = expand(os.path.join("01_BAM_filtered/shifted", ''.join(["{sample}_mapq", MAPQ, "_woMT_shifted_sorted.bam"])), sample = SAMPLENAMES),
-                bais = expand(os.path.join("01_BAM_filtered/shifted", ''.join(["{sample}_mapq", MAPQ, "_woMT_shifted_sorted.bam.bai"])), sample = SAMPLENAMES),
+                bams = lambda wildcards: [shifted_bam(s) for s in samples_in_group[wildcards.GROUP]],
+                bais = lambda wildcards: [shifted_bai(s) for s in samples_in_group[wildcards.GROUP]],
                 greenlist = GREENLIST_HARMONIZED
             output:
-                saf = temp(os.path.join(GREENLISTDIR, "greenlist_regions.saf")),
-                raw = temp(os.path.join(GREENLISTDIR, "greenlist_raw_counts.featureCounts.txt")),
-                counts = os.path.join(GREENLISTDIR, "greenlist_raw_counts.tsv")
+                saf = temp(os.path.join(GREENLISTDIR, "{GROUP}/greenlist_regions.saf")),
+                raw = temp(os.path.join(GREENLISTDIR, "{GROUP}/greenlist_raw_counts.featureCounts.txt")),
+                counts = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_raw_counts.tsv")
             params:
-                greenlist_dir = GREENLISTDIR,
-                labels = ' '.join(SAMPLENAMES)
+                group = "{GROUP}",
+                log_dir = os.path.join(GREENLISTDIR, "{GROUP}/logs"),
+                labels = lambda wildcards: ' '.join(samples_in_group[wildcards.GROUP])
             threads:
                 max((workflow.cores - 1), 1)
             log:
-                out = os.path.join(GREENLISTDIR, "logs/greenlist_featureCounts.out"),
-                err = os.path.join(GREENLISTDIR, "logs/greenlist_featureCounts.err")
+                out = os.path.join(GREENLISTDIR, "{GROUP}/logs/greenlist_featureCounts.out"),
+                err = os.path.join(GREENLISTDIR, "{GROUP}/logs/greenlist_featureCounts.err")
             benchmark:
-                "benchmarks/greenlist_counts/greenlist_counts---featureCounts_benchmark.txt"
+                "benchmarks/greenlist_counts/greenlist_counts---featureCounts---{GROUP}_benchmark.txt"
             shell:
                 """
-                printf '\033[1;36mQuantifying the greenlist regions (featureCounts)...\\n\033[0m'
+                printf '\033[1;36m{params.group}: quantifying the greenlist regions (featureCounts)...\\n\033[0m'
 
-                mkdir -p {params.greenlist_dir}logs
+                mkdir -p {params.log_dir}
 
                 # SAF is 1-based and end-inclusive, BED is 0-based and end-exclusive
                 printf 'GeneID\\tChr\\tStart\\tEnd\\tStrand\\n' > {output.saf}
@@ -1057,36 +1124,38 @@ if run_greenlist:
 
     rule greenlist_sizeFactors:
         input:
-            counts = os.path.join(GREENLISTDIR, "greenlist_raw_counts.tsv"),
-            flagstat = expand(os.path.join("01_BAM_filtered/flagstat/", ''.join(["{sample}_mapq", MAPQ, "_woMT_shifted_sorted_flagstat.txt"])), sample = SAMPLENAMES)
+            counts = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_raw_counts.tsv"),
+            flagstat = lambda wildcards: [os.path.join("01_BAM_filtered/flagstat/", ''.join([s, "_mapq", MAPQ, "_woMT_shifted_sorted_flagstat.txt"])) for s in samples_in_group[wildcards.GROUP]]
         output:
-            size_factors = GREENLIST_SIZE_FACTORS,
-            macs_ratio = MACS_RATIO_TABLE,
-            barplot = os.path.join(GREENLISTDIR, "greenlist_sizeFactors_barplot.pdf"),
-            boxplot = os.path.join(GREENLISTDIR, "greenlist_background_consistency_boxplot.pdf"),
-            fragments = temp(os.path.join(GREENLISTDIR, "greenlist_total_fragments.tsv")),
-            script = temp(os.path.join(GREENLISTDIR, "greenlist_sizeFactors.R"))
+            size_factors = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_sizeFactors.tsv"),
+            barplot = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_sizeFactors_barplot.pdf"),
+            boxplot = os.path.join(GREENLISTDIR, "{GROUP}/greenlist_background_consistency_boxplot.pdf"),
+            fragments = temp(os.path.join(GREENLISTDIR, "{GROUP}/greenlist_total_fragments.tsv")),
+            script = temp(os.path.join(GREENLISTDIR, "{GROUP}/greenlist_sizeFactors.R"))
         params:
-            greenlist_dir = GREENLISTDIR,
+            group = "{GROUP}",
+            log_dir = os.path.join(GREENLISTDIR, "{GROUP}/logs"),
             method = greenlist_size_factor_method,
             min_shared_regions = greenlist_min_shared_regions,
             rescale = greenlist_rescale
         threads: 1
         log:
-            out = os.path.join(GREENLISTDIR, "logs/greenlist_sizeFactors.log")
+            out = os.path.join(GREENLISTDIR, "{GROUP}/logs/greenlist_sizeFactors.log")
         benchmark:
-            "benchmarks/greenlist_sizeFactors/greenlist_sizeFactors---benchmark.txt"
+            "benchmarks/greenlist_sizeFactors/greenlist_sizeFactors---{GROUP}_benchmark.txt"
         run:
             # The R code below is written to a file as a plain string instead of being
             # embedded in a shell block: every brace of an R script would otherwise have to
             # be doubled for the snakemake formatter, which is a reliable source of silent
             # typos.
-            os.makedirs(os.path.join(params.greenlist_dir, "logs"), exist_ok = True)
+            os.makedirs(params.log_dir, exist_ok = True)
+
+            group_samples = samples_in_group[wildcards.GROUP]
 
             ### total fragments per sample, read from the flagstat of the shifted bam
             with open(output.fragments, "w") as fragments_file:
                 fragments_file.write("sample\tfragments\n")
-                for sample, flagstat_path in zip(SAMPLENAMES, input.flagstat):
+                for sample, flagstat_path in zip(group_samples, input.flagstat):
                     n_fragments = 0
                     n_total = 0
                     with open(flagstat_path) as flagstat:
@@ -1120,18 +1189,29 @@ out_boxplot    <- args[8]
 counts <- as.matrix(read.delim(counts_file, header = TRUE, row.names = 1, check.names = FALSE))
 mode(counts) <- "numeric"
 
-### a ratio-based estimator can only use the regions covered in every sample
+### the classic median-of-ratios estimator drops any region that is empty in even one
+### sample, so a single shallow control can empty most of the matrix on its own
 shared <- counts[apply(counts, 1, function(x) all(x > 0)), , drop = FALSE]
+non_zero_per_sample <- colSums(counts > 0)
 
-if (nrow(shared) < min_regions) {
-  stop(paste0("only ", nrow(shared), " greenlist regions carry signal in every sample, ",
-              "the minimum is ", min_regions,
-              ". Check that the greenlist matches the assay and the genome build."))
+if (method == "median_of_ratios" && nrow(shared) < min_regions) {
+  stop(paste0("only ", nrow(shared), " of ", nrow(counts),
+              " greenlist regions carry signal in every sample, the minimum is ", min_regions, ".",
+              "\n  Regions with signal, per sample: ",
+              paste0(names(non_zero_per_sample), "=", non_zero_per_sample, collapse = ", "),
+              "\n  When one sample is far below the others the cause is sequencing depth, and",
+              "\n  size_factor_method 'poscounts' handles it. When every sample is low, check the",
+              "\n  genome build and the assay of the greenlist bed before changing anything."))
 }
 
 if (method == "median_of_ratios") {
   suppressPackageStartupMessages(library(DESeq2))
-  size_factor <- DESeq2::estimateSizeFactorsForMatrix(shared)
+  size_factor <- DESeq2::estimateSizeFactorsForMatrix(shared, type = "ratio")
+} else if (method == "poscounts") {
+  ### geometric means taken over the positive counts only, so a region empty in one sample
+  ### still contributes for the others instead of being discarded
+  suppressPackageStartupMessages(library(DESeq2))
+  size_factor <- DESeq2::estimateSizeFactorsForMatrix(counts, type = "poscounts")
 } else {
   total <- colSums(counts)
   size_factor <- total / exp(mean(log(total)))
@@ -1152,9 +1232,19 @@ if (rescale_mode == "geometric_mean") {
 }
 
 ### how tightly each sample follows the cohort background: a wide spread means the greenlist
-### assumption does not hold for that sample and its factor should not be trusted
-log_ratio <- log(shared) - rowMeans(log(shared))
-log_ratio_sd <- apply(log_ratio, 2, sd)
+### assumption does not hold for that sample and its factor should not be trusted.
+### With a sparse matrix there are too few fully covered regions to say anything, so the
+### diagnostic falls back to the regions covered in at least half of the samples and treats
+### the remaining zeros as missing.
+if (nrow(shared) >= 20) {
+  diagnostic_counts <- shared
+} else {
+  diagnostic_counts <- counts[rowSums(counts > 0) >= ceiling(ncol(counts) / 2), , drop = FALSE]
+  diagnostic_counts[diagnostic_counts == 0] <- NA
+}
+
+log_ratio <- log(diagnostic_counts) - rowMeans(log(diagnostic_counts), na.rm = TRUE)
+log_ratio_sd <- apply(log_ratio, 2, sd, na.rm = TRUE)
 
 fragments <- read.delim(fragments_file, header = TRUE, check.names = FALSE)
 rownames(fragments) <- as.character(fragments$sample)
@@ -1165,6 +1255,8 @@ result <- data.frame(sample = colnames(counts),
                      greenlist_signal = as.numeric(colSums(counts)),
                      total_fragments = as.numeric(fragments[colnames(counts), "fragments"]),
                      log_ratio_sd = as.numeric(log_ratio_sd[colnames(counts)]),
+                     regions_with_signal = as.numeric(non_zero_per_sample[colnames(counts)]),
+                     total_regions = nrow(counts),
                      shared_regions = nrow(shared),
                      stringsAsFactors = FALSE)
 
@@ -1197,6 +1289,8 @@ ratio_long <- data.frame(sample = rep(colnames(log_ratio), each = nrow(log_ratio
                          log2_ratio = as.vector(log_ratio) / log(2),
                          stringsAsFactors = FALSE)
 
+ratio_long <- ratio_long[is.finite(ratio_long$log2_ratio), ]
+
 consistency_plot <- ggplot2::ggplot(ratio_long, ggplot2::aes(x = sample, y = log2_ratio)) +
   ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "grey30") +
   ggplot2::geom_boxplot(fill = "grey90", outlier.size = 0.2, outlier.alpha = 0.3) +
@@ -1216,43 +1310,72 @@ invisible(dev.off())
             with open(output.script, "w") as script_file:
                 script_file.write(r_script)
 
-            shell("printf '\033[1;36mComputing greenlist size factors ({params.method})...\\n\033[0m'")
+            shell("printf '\033[1;36m{params.group}: computing greenlist size factors ({params.method})...\\n\033[0m'")
 
             shell("$CONDA_PREFIX/bin/Rscript --vanilla {output.script} "
                   "{input.counts} {output.fragments} {params.method} {params.min_shared_regions} "
                   "{params.rescale} {output.size_factors} {output.barplot} {output.boxplot} "
                   "&> {log.out}")
 
-            ### MACS3 scaling ratios, target over control
-            size_factor = {}
-            with open(output.size_factors) as size_factor_file:
-                size_factor_file.readline()
-                for line in size_factor_file:
-                    fields = line.rstrip("\n").split("\t")
-                    size_factor[fields[0]] = float(fields[1])
 
+    rule greenlist_aggregate_sizeFactors:
+        input:
+            size_factors = [os.path.join(GREENLISTDIR, group, "greenlist_sizeFactors.tsv") for group in greenlist_groups_run]
+        output:
+            all_size_factors = GREENLIST_SIZE_FACTORS,
+            macs_ratio = MACS_RATIO_TABLE
+        params:
+            groups = greenlist_groups_run
+        threads: 1
+        benchmark:
+            "benchmarks/greenlist_aggregate_sizeFactors/greenlist_aggregate_sizeFactors---benchmark.txt"
+        run:
+            shell("printf '\033[1;36mCollecting the greenlist size factors of all groups...\\n\033[0m'")
+
+            size_factor = {}
+            header_written = False
+
+            with open(output.all_size_factors, "w") as merged_file:
+                for group, table_path in zip(params.groups, input.size_factors):
+                    with open(table_path) as group_table:
+                        header = group_table.readline().rstrip("\n")
+                        if not header_written:
+                            merged_file.write(''.join(["normalization_group\t", header, "\n"]))
+                            header_written = True
+                        for line in group_table:
+                            fields = line.rstrip("\n").split("\t")
+                            size_factor[fields[0]] = float(fields[1])
+                            merged_file.write(''.join([str(group), "\t", line.rstrip("\n"), "\n"]))
+
+            ### MACS3 scaling ratios, target over control. A target and its control always
+            ### belong to the same group, so the two factors are on a common scale. Targets
+            ### whose group was skipped simply get no row and no --ratio option.
             with open(output.macs_ratio, "w") as ratio_file:
-                ratio_file.write("target_id\tcontrol_id\tsize_factor_target\tratio\n")
+                ratio_file.write("target_id\tcontrol_id\tsize_factor_target\tratio\tnormalization_group\n")
                 for target in TARGETNAMES:
                     control = control_of[target]
                     if control == target:
                         continue
+                    if (target not in size_factor) or (control not in size_factor):
+                        continue
                     ratio = size_factor[target] / size_factor[control]
                     ratio_file.write(''.join([target, "\t", control, "\t",
                                               "{:.6f}".format(size_factor[target]), "\t",
-                                              "{:.6f}".format(ratio), "\n"]))
+                                              "{:.6f}".format(ratio), "\t",
+                                              str(group_of[target]), "\n"]))
 
 
     rule greenlist_normalized_bigWig:
         input:
             bam = os.path.join("01_BAM_filtered/shifted", ''.join(["{SAMPLES}_mapq", MAPQ, "_woMT_shifted_sorted.bam"])),
             bai = os.path.join("01_BAM_filtered/shifted", ''.join(["{SAMPLES}_mapq", MAPQ, "_woMT_shifted_sorted.bam.bai"])),
-            size_factors = GREENLIST_SIZE_FACTORS,
+            size_factors = lambda wildcards: os.path.join(GREENLISTDIR, group_of[wildcards.SAMPLES], "greenlist_sizeFactors.tsv"),
             blacklist = BLACKLIST_HARMONIZED
         output:
             greenlist_bigWig = os.path.join("03_bigWig_bamCoverage/greenlist_normalized/", ''.join(["{SAMPLES}_mapq", MAPQ, "_greenlist.normalized_bs", BIN_SIZE, ".bw"]))
         params:
             sample = "{SAMPLES}",
+            group = lambda wildcards: group_of[wildcards.SAMPLES],
             genomeSize = config["genomic_annotations"]["effective_genomeSize"],
             ignore_for_normalization = config["genomic_annotations"]["ignore_for_normalization"],
             bw_binSize = BIN_SIZE
@@ -1265,7 +1388,7 @@ invisible(dev.off())
             "benchmarks/greenlist_normalized_bigWig/greenlist_normalized_bigWig---{SAMPLES}_benchmark.txt"
         shell:
             """
-            printf '\033[1;36m{params.sample}: generating greenlist-normalized bigWig...\\n\033[0m'
+            printf '\033[1;36m{params.sample}: generating greenlist-normalized bigWig (group {params.group})...\\n\033[0m'
 
             mkdir -p 03_bigWig_bamCoverage/greenlist_normalized/logs
 

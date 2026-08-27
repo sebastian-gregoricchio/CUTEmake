@@ -8,8 +8,20 @@
 workflow_configuration:
   runs_directory: "/path/to/your/bams"
   output_directory: "/path/to/output/folder"
-  # Tab-separated table with a header and three columns: target_id | control_id | broad
+  # Tab-separated table with a header and three or four columns:
+  #     target_id | control_id | broad | normalization_group
+  #
   # A sample without a control carries its own name in control_id.
+  #
+  # normalization_group is optional and only used by the greenlist normalization: samples
+  # sharing a group have their size factors estimated together. Group by antibody unless you
+  # have a reason not to. A target and its control have to sit in the same group. Leave the
+  # column out entirely and every sample lands in one group called "all_samples".
+  #
+  #     target_id                 control_id    broad   normalization_group
+  #     U2932_H3K27ac_DMSO_rep1   IgG_1         FALSE   H3K27ac
+  #     U2932_H3K27ac_COMBO_rep1  IgG_1         FALSE   H3K27ac
+  #     U2932_H3K27me3_DMSO_rep1  IgG_2         TRUE    H3K27me3
   sample_config_table: "/path/to/sample/configuration/table"
 
 bam_features:
@@ -58,15 +70,24 @@ normalization:
     # fragments rather than reads
     counting_method: "multiBamSummary"   # multiBamSummary | featureCounts
 
-    # median_of_ratios calls DESeq2::estimateSizeFactorsForMatrix, total_counts uses the
-    # summed greenlist signal normalized to its own geometric mean
-    size_factor_method: "median_of_ratios"   # median_of_ratios | total_counts
+    # median_of_ratios  DESeq2 type='ratio', the published method. Uses only the regions
+    #                   covered in every sample, so one shallow control can empty the matrix
+    # poscounts         DESeq2 type='poscounts', geometric means over the positive counts
+    #                   only. Use this when the samples differ a lot in depth
+    # total_counts      summed greenlist signal normalized to its own geometric mean, the
+    #                   simplest fallback and the only one that needs no shared regions
+    size_factor_method: "median_of_ratios"   # median_of_ratios | poscounts | total_counts
 
-    # regions must carry signal in every sample to contribute to a ratio-based estimator;
-    # the workflow stops if fewer than this many survive
+    # applies to median_of_ratios only: the workflow stops when fewer than this many regions
+    # carry signal in every sample, because below that the estimate rests on the handful of
+    # strongest regions rather than on the greenlist as a whole
     min_shared_regions: 200
 
-    # size factors are relative to the cohort, so a minimum number of samples is required
+    # minimum number of samples per normalization group. Groups below it are skipped
+    # individually, with a note left in their folder, while the other groups still run.
+    # Two is defensible for a group holding a single pair of samples: median-of-ratios then
+    # reduces to the median count ratio between them, which is what a two-sample comparison
+    # needs. What you lose is any way of telling which of the two is misbehaving.
     min_samples: 3
 
     # rescales the applied factors by a single constant, which changes the height of every
@@ -75,6 +96,7 @@ normalization:
 
     # passes --ratio (size_factor_target / size_factor_control) to MACS3 for the samples
     # that have a control. GoPeaks has no equivalent option and is left unaffected.
+    # Targets whose group was skipped keep the default MACS3 depth-based scaling.
     use_for_peak_calling: True
 
 
