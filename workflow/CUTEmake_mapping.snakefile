@@ -3,11 +3,7 @@
 #########################################
 
 import os
-#conda_prefix = str(os.environ["CONDA_PREFIX"])
-
 import sys
-#sys.path.insert(1, conda_prefix+"/lib/python"+str(sys.version_info[0])+"."+str(sys.version_info[1])+"/site-packages")
-
 from typing import List
 import pathlib
 import re
@@ -17,69 +13,126 @@ import math
 from itertools import combinations
 
 
-# Define general variables
+# ========================================================================================
+#                                    HELPER FUNCTIONS
+# ========================================================================================
+
+def str2bool(value) -> bool:
+    """
+    Reads a configuration value as a boolean without going through eval().
+    YAML already converts True/true/yes to a python bool, this only covers the cases in
+    which the value reaches us as a string.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ["true", "t", "yes", "y", "1"]
+
+
+def constraint_to(values: List[str]) -> str:
+    """
+    From a list, return a regular expression allowing each value and not other.
+    ex: ["a", "b", "v"] -> (a|b|v)
+    Values are escaped: sample names containing dots or brackets would otherwise be read as
+    regular expressions and match more than themselves.
+    """
+    if isinstance(values, str):
+        raise ValueError("constraint_to(): Expected a list, got str instead")
+    if len(values) == 0:
+        raise ValueError("constraint_to(): Expected a non-empty list")
+
+    return "({})".format("|".join([re.escape(str(i)) for i in values]))
+
+
+def split_cores(n_jobs, reserve = 0) -> int:
+    """
+    Splits the available cores over the number of jobs a rule will spawn, keeping at least
+    one core per job.
+    """
+    return max(math.floor((workflow.cores - reserve) / max(int(n_jobs), 1)), 1)
+
+
+# ========================================================================================
+#                                  GENERAL VARIABLES
+# ========================================================================================
+
 genome_fasta = str(config["genome_fasta"])
+MAPQ = str(config["MAPQ_threshold"])
+fastq_suffix = str(config["fastq_suffix"])
+read_suffix = list(config["read_suffix"])
 
 
 ### working directory
-home_dir = os.path.join(config["output_directory"],"")
+home_dir = os.path.join(config["output_directory"], "")
 shell('mkdir -p {home_dir}')
 workdir: home_dir
 
 
-
-# if (eval(str(config["remove_duplicates"])) == True):
-#     DUP = "dedup"
-# else:
-#     DUP = "mdup"
-
-
-# get the unique samples names and other variables
+### get the unique samples names and other variables
 if not (os.path.exists(config["fastq_directory"])):
-    os.system("printf '\033[1;31m\\n!!! *fastq_directory* does not exist !!!\\n\\n\033[0m'")
+    sys.exit("\033[1;31m\n!!! *fastq_directory* does not exist !!!\n\n\033[0m")
 
-FILENAMES = next(os.walk(config["fastq_directory"]))[2]
-RUNNAMES = [re.sub(rf"{config['fastq_suffix']}$", "", i) for i in FILENAMES]
-SAMPLENAMES = numpy.sort(numpy.unique([re.sub(rf"{config['read_suffix'][0]}|{config['read_suffix'][1]}.*$", "", i) for i in RUNNAMES]))
+# only files carrying the expected suffix are considered: md5 checksums, READMEs and index
+# reads sitting in the same folder would otherwise be picked up as samples
+FILENAMES = sorted([f for f in next(os.walk(config["fastq_directory"]))[2] if f.endswith(fastq_suffix)])
+
+if len(FILENAMES) == 0:
+    sys.exit(''.join(["\033[1;31m\n!!! No file ending in '", fastq_suffix, "' found in *fastq_directory* !!!\n\n\033[0m"]))
+
+RUNNAMES = [re.sub(rf"{re.escape(fastq_suffix)}$", "", i) for i in FILENAMES]
+
+# the alternation must be grouped: '_R1|_R2.*$' is read as '(_R1)|(_R2.*$)' and strips the
+# trailing part of R2 file names only, which splits each pair into two different samples
+SAMPLENAMES = list(numpy.sort(numpy.unique(
+    [re.sub(rf"({re.escape(read_suffix[0])}|{re.escape(read_suffix[1])}).*$", "", i) for i in RUNNAMES]
+)))
+
+# consistency check: the trimmed files are named <sample><read_suffix>_trimmed.fastq.gz, so
+# the run names must be reconstructible from the sample names. When they are not, the most
+# common cause is a lane/chunk field left out of *fastq_suffix* (e.g. '_001.fastq.gz')
+EXPECTED_RUNNAMES = sorted([''.join([s, r]) for s in SAMPLENAMES for r in read_suffix])
+if sorted(RUNNAMES) != EXPECTED_RUNNAMES:
+    sys.exit(''.join(["\033[1;31m\n!!! *fastq_suffix* and *read_suffix* do not reconstruct the fastq file names !!!\n",
+                      "    found:    ", ', '.join(sorted(RUNNAMES)[0:4]), " ...\n",
+                      "    expected: ", ', '.join(EXPECTED_RUNNAMES[0:4]), " ...\n",
+                      "    Check that *fastq_suffix* includes everything that follows the read tag.\n\n\033[0m"]))
+
+RUNNAMES = EXPECTED_RUNNAMES
 
 
-# Chromosome remove chr_remove_pattern
-if (len(config["remove_other_chromosomes_pattern"]) > 0):
-    chr_remove_pattern = '^chrM|^M|'+config["remove_other_chromosomes_pattern"]
+### Chromosome remove pattern
+if (len(str(config["remove_other_chromosomes_pattern"])) > 0):
+    chr_remove_pattern = '^chrM|^M|' + str(config["remove_other_chromosomes_pattern"])
 else:
     chr_remove_pattern = '^chrM|^M'
 
 
+### Read filtering flags
+if str2bool(config["keep_only_proper_pairs"]):
+    # -f 2 drops the orphan mates left behind by the MAPQ filter: they are still flagged as
+    # paired but their mate is gone, and every paired-end aware tool downstream discards
+    # them anyway. Removing them here keeps the flagstat counts honest.
+    proper_pair_flag = "-f 2"
+else:
+    proper_pair_flag = ""
+
+
 ### Optional analysis outputs
-if (eval(str(config["run_fastq_qc"])) == True):
+if str2bool(config["run_fastq_qc"]):
     multiqc_fastq = "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.html"
 else:
     multiqc_fastq = []
 
 
 ### Generation of global wildcard_constraints
-# Function to handle the values for the wilcards
-def constraint_to(values: List[str]) -> str:
-    """
-    From a list, return a regular expression allowing each
-    value and not other.
-    ex: ["a", "b", "v"] -> (a|b|v)
-    """
-    if isinstance(values, str):
-            raise ValueError("constraint_to(): Expected a list, got str instead")
-    return "({})".format("|".join(values))
-
 wildcard_constraints:
     SAMPLE = constraint_to(SAMPLENAMES),
     RUNS = constraint_to(RUNNAMES)
 
 
-# ruleorder: fastQC_filtered_BAM > normalized_bigWig > raw_bigWig
-
 # ========================================================================================
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 # ========================================================================================
-# Function to run all funtions
+# Function to run all functions
 rule AAA_initialization:
     input:
         multiqc_bam_report = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.html",
@@ -96,42 +149,45 @@ rule AAA_initialization:
 ### Generate bowtie index if required
 if not os.path.exists("".join([config["bowtie2_idx_prefix"], ".1.bt2"])):
     # ----------------------------------------------------------------------------------------
-    # Reads alignement
+    # Genome index generation
     rule extra_generate_genome_index:
         input:
             genome = ancient(config["genome_fasta"])
         output:
-            genome_fai = "".join([config["bowtie2_idx_prefix"], ".1.bt2"])
+            genome_idx = "".join([config["bowtie2_idx_prefix"], ".1.bt2"])
         params:
             bowtie2_idx_prefix = config["bowtie2_idx_prefix"],
             idx_folder = os.path.abspath(os.path.join(config["bowtie2_idx_prefix"], os.pardir))
-        threads: 1
+        threads:
+            workflow.cores
+        log:
+            out = "".join([config["bowtie2_idx_prefix"], "_bowtie2.build.log"])
         shell:
             """
             printf '\033[1;36mGenerating the genome index...\\n\033[0m'
 
             mkdir -p {params.idx_folder}/
 
-            bowtie2-build -f {input.genome} {params.bowtie2_idx_prefix}
+            $CONDA_PREFIX/bin/bowtie2-build --threads {threads} -f {input.genome} {params.bowtie2_idx_prefix} > {log.out} 2>&1
             printf '\033[1;36mGenome index done.\\n\033[0m'
             """
 # ----------------------------------------------------------------------------------------
 
 
 
-# cutdapat -------------------------------------------------------------------------------
+# cutadapt -------------------------------------------------------------------------------
 rule cutadapt_PE:
     input:
-        R1 = os.path.join(config["fastq_directory"], "".join(["{SAMPLE}", config['read_suffix'][0], config['fastq_suffix']])),
-        R2 = os.path.join(config["fastq_directory"], "".join(["{SAMPLE}", config['read_suffix'][1], config['fastq_suffix']]))
+        R1 = os.path.join(config["fastq_directory"], "".join(["{SAMPLE}", read_suffix[0], fastq_suffix])),
+        R2 = os.path.join(config["fastq_directory"], "".join(["{SAMPLE}", read_suffix[1], fastq_suffix]))
     output:
-        R1_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", config['read_suffix'][0], "_trimmed.fastq.gz"])),
-        R2_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", config['read_suffix'][1], "_trimmed.fastq.gz"]))
+        R1_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", read_suffix[0], "_trimmed.fastq.gz"])),
+        R2_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", read_suffix[1], "_trimmed.fastq.gz"]))
     params:
         sample = "{SAMPLE}",
         opts = str(config["cutadapt_trimm_options"]),
         fw_adapter_sequence = str(config["fw_adapter_sequence"]),
-        rv_adapter_sequence = str(config["fw_adapter_sequence"])
+        rv_adapter_sequence = str(config["rv_adapter_sequence"])
     log:
         out = "01_trimmed_fastq/logs/cutadapt.{SAMPLE}.out",
         err = "01_trimmed_fastq/logs/cutadapt.{SAMPLE}.err"
@@ -144,32 +200,36 @@ rule cutadapt_PE:
         printf '\033[1;36m{params.sample}: reads trimming...\\n\033[0m'
         mkdir -p 01_trimmed_fastq/logs/
 
-        ${{CONDA_PREFIX}}/bin/cutadapt \
+        $CONDA_PREFIX/bin/cutadapt \
         -j {threads} -e 0.1 -q 16 -O 3 --trim-n --minimum-length 25 \
         -a {params.fw_adapter_sequence} -A {params.rv_adapter_sequence} {params.opts} \
         -o {output.R1_trimm} -p {output.R2_trimm} {input.R1} {input.R2} > {log.out} 2> {log.err}
         """
+# ----------------------------------------------------------------------------------------
 
 
 # ----------------------------------------------------------------------------------------
-# Reads alignement
+# Reads alignment
 rule bowtie2_mapping:
     input:
-        R1_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", config['read_suffix'][0], "_trimmed.fastq.gz"])),
-        R2_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", config['read_suffix'][1], "_trimmed.fastq.gz"])),
-        genome_fai = "".join([config["bowtie2_idx_prefix"], ".1.bt2"])
+        R1_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", read_suffix[0], "_trimmed.fastq.gz"])),
+        R2_trimm = os.path.join("01_trimmed_fastq", "".join(["{SAMPLE}", read_suffix[1], "_trimmed.fastq.gz"])),
+        genome_idx = "".join([config["bowtie2_idx_prefix"], ".1.bt2"])
     output:
         SAM = temp("02_BAM/{SAMPLE}.sam")
     params:
         build_SAM = "02_BAM/",
         build_log_dir = "02_BAM/bowtie2_aln_summary/",
         bowtie2_idx_prefix = config["bowtie2_idx_prefix"],
+        minFragmentLength = str(config["bowtie2_minFragmentLength"]),
+        maxFragmentLength = str(config["bowtie2_maxFragmentLength"]),
+        extra_params = str(config["bowtie2_extra_parameters"]),
         sample = "{SAMPLE}"
     threads:
         workflow.cores
     log:
-        out = os.path.join("02_BAM/bowtie2_aln_summary/{SAMPLE}_bowtie2_METRICS.out"),
-        err = os.path.join("02_BAM/bowtie2_aln_summary/{SAMPLE}_bowtie2_summary.err")
+        metrics = os.path.join("02_BAM/bowtie2_aln_summary/{SAMPLE}_bowtie2_METRICS.out"),
+        summary = os.path.join("02_BAM/bowtie2_aln_summary/{SAMPLE}_bowtie2_summary.err")
     benchmark:
         "benchmarks/bowtie2_mapping/bowtie2_mapping---{SAMPLE}_benchmark.txt"
     shell:
@@ -179,20 +239,24 @@ rule bowtie2_mapping:
 
         printf '\033[1;36m{params.sample}: alignment of the trimmed reads (bowtie2)...\\n\033[0m'
 
+        # --end-to-end and --local are mutually exclusive, bowtie2 silently keeps the last
+        # one it is given. The CUT&Tag protocol calls for end-to-end alignment, so --local
+        # must not appear here.
         $CONDA_PREFIX/bin/bowtie2 \
         -x {params.bowtie2_idx_prefix} \
         -1 {input.R1_trimm} \
         -2 {input.R2_trimm} \
         -S {output.SAM} \
         --end-to-end \
-        --local --very-sensitive \
+        --very-sensitive \
         --no-mixed \
         --no-discordant \
         --phred33 \
-        -I 10 \
-        -X 700 \
-        --met-file {log.out} \
-        -p {threads} 2> {log.err}
+        -I {params.minFragmentLength} \
+        -X {params.maxFragmentLength} \
+        {params.extra_params} \
+        --met-file {log.metrics} \
+        -p {threads} 2> {log.summary}
         """
 # --------------------------------------------------------------------------------------------------
 
@@ -202,28 +266,34 @@ rule MAPQ_MT_filter:
     input:
         source_sam = "02_BAM/{SAMPLE}.sam"
     output:
-        bam_mateFixed = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_mateFixed.bam"]))),
-        bam_mapq_only = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), ".bam"]))),
-        bam_mapq_only_sorted = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted.bam"]))),
-        bam_mapq_only_sorted_index = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted.bai"]))),
+        bam_mateFixed = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_mateFixed.bam"]))),
+        bam_mapq_only = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, ".bam"]))),
+        bam_mapq_only_sorted = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_sorted.bam"]))),
+        bam_mapq_only_sorted_index = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_sorted.bam.bai"]))),
+        keep_chromosomes = temp(os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_keptChromosomes.txt"]))),
         idxstats_file = "02_BAM/reads_per_chromosome/{SAMPLE}_idxstats_read_per_chromosome.txt",
-        bam_mapq_only_sorted_woMT = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT.bam"])),
-        bam_mapq_only_sorted_woMT_index = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT.bam.bai"])),
-        flagstat_filtered = os.path.join("02_BAM/flagstat/", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT_flagstat.txt"]))
+        bam_mapq_only_sorted_woMT = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_sorted_woMT.bam"])),
+        bam_mapq_only_sorted_woMT_index = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", MAPQ, "_sorted_woMT.bam.bai"])),
+        flagstat_filtered = os.path.join("02_BAM/flagstat/", ''.join(["{SAMPLE}_mapq", MAPQ, "_sorted_woMT_flagstat.txt"]))
     params:
         sample = "{SAMPLE}",
-        MAPQ_threshold = config["MAPQ_threshold"],
+        MAPQ_threshold = MAPQ,
+        proper_pair_flag = proper_pair_flag,
         chr_remove_pattern = chr_remove_pattern
     threads:
-        max(math.floor(workflow.cores/len(SAMPLENAMES)), 1)
+        split_cores(len(SAMPLENAMES))
     benchmark:
         "benchmarks/MAPQ_MT_filter/MAPQ_MT_filter---{SAMPLE}_benchmark.txt"
     shell:
         """
-        printf '\033[1;36m{params.sample}: filtering MAPQ and remove mitochondrial chromosome...\\n\033[0m'
+        printf '\033[1;36m{params.sample}: filtering MAPQ and removing mitochondrial chromosome...\\n\033[0m'
+
+        mkdir -p 02_BAM/reads_per_chromosome
+        mkdir -p 02_BAM/flagstat
+
         $CONDA_PREFIX/bin/samtools fixmate -@ {threads} -m -O bam {input.source_sam} {output.bam_mateFixed}
 
-        $CONDA_PREFIX/bin/samtools view -@ {threads} -Sb -h -q {params.MAPQ_threshold} {output.bam_mateFixed} -o {output.bam_mapq_only}
+        $CONDA_PREFIX/bin/samtools view -@ {threads} -Sb -h -q {params.MAPQ_threshold} {params.proper_pair_flag} {output.bam_mateFixed} -o {output.bam_mapq_only}
 
         $CONDA_PREFIX/bin/samtools sort -@ {threads} {output.bam_mapq_only} -o {output.bam_mapq_only_sorted}
         $CONDA_PREFIX/bin/samtools index -@ {threads} -b {output.bam_mapq_only_sorted} {output.bam_mapq_only_sorted_index}
@@ -231,137 +301,112 @@ rule MAPQ_MT_filter:
         $CONDA_PREFIX/bin/samtools idxstats {output.bam_mapq_only_sorted} > {output.idxstats_file}
 
         printf '\033[1;36m{params.sample}: Removing MT from BAM...\\n\033[0m'
-        $CONDA_PREFIX/bin/samtools idxstats {output.bam_mapq_only_sorted} | cut -f 1 | grep -v -E '{params.chr_remove_pattern}' | xargs ${{CONDA_PREFIX}}/bin/samtools view -@ {threads} -b {output.bam_mapq_only_sorted} > {output.bam_mapq_only_sorted_woMT}
+
+        # the list of contigs to keep is written to a file and expanded in a single samtools
+        # call: piping it through xargs splits the command line on fragmented assemblies and
+        # concatenates several BAMs, each with its own header, into one truncated file
+        $CONDA_PREFIX/bin/samtools idxstats {output.bam_mapq_only_sorted} | cut -f 1 | grep -v -E '{params.chr_remove_pattern}' | grep -v '^\\*$' > {output.keep_chromosomes}
+
+        $CONDA_PREFIX/bin/samtools view -@ {threads} -b {output.bam_mapq_only_sorted} $(tr '\\n' ' ' < {output.keep_chromosomes}) > {output.bam_mapq_only_sorted_woMT}
         $CONDA_PREFIX/bin/samtools index -@ {threads} -b {output.bam_mapq_only_sorted_woMT} {output.bam_mapq_only_sorted_woMT_index}
 
         $CONDA_PREFIX/bin/samtools flagstat -@ {threads} {output.bam_mapq_only_sorted_woMT} > {output.flagstat_filtered}
         """
+# --------------------------------------------------------------------------------------------------
 
 
-# ## remove/mark duplicates
-# rule gatk4_markdups:
-#     input:
-#         bam_mapq_only_sorted = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT.bam"])),
-#         bam_mapq_only_sorted_index = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT.bam.bai"]))
-#     output:
-#         bam_mdup = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT_", DUP, ".bam"])),
-#         bai_mdup = os.path.join("02_BAM", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT_", DUP, ".bai"])),
-#         dup_metrics = "02_BAM/MarkDuplicates_metrics/{SAMPLE}_MarkDuplicates_metrics.txt",
-#         flagstat_filtered = os.path.join("02_BAM/flagstat/", ''.join(["{SAMPLE}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT_", DUP, "_flagstat.txt"]))
-#     params:
-#         remove_duplicates = (str(config["remove_duplicates"])).lower(),
-#         sample = "{SAMPLE}"
-#     log:
-#         out = "02_BAM/MarkDuplicates_logs/{SAMPLE}_MarkDuplicates.out",
-#         err = "02_BAM/MarkDuplicates_logs/{SAMPLE}_MarkDuplicates.err"
-#     threads:
-#         workflow.cores
-#     benchmark:
-#         "benchmarks/gatk4_markdups/gatk4_markdups---{SAMPLE}_benchmark.txt"
-#     shell:
-#         """
-#         printf '\033[1;36m{params.sample}: 'standard' gatk MarkDuplicates...\\n\033[0m'
-#
-#         mkdir -p 02_BAM/MarkDuplicates_metrics
-#         mkdir -p 02_BAM/MarkDuplicates_logs
-#         mkdir -p 02_BAM/flagstat
-#
-#         $CONDA_PREFIX/bin/gatk MarkDuplicatesWithMateCigar \
-#         --INPUT {input.bam_mapq_only_sorted} \
-#         --OUTPUT {output.bam_mdup} \
-#         --REMOVE_DUPLICATES {params.remove_duplicates} \
-#         --OPTICAL_DUPLICATE_PIXEL_DISTANCE 2500 \
-#         --CREATE_INDEX true \
-#         --VALIDATION_STRINGENCY LENIENT \
-#         --METRICS_FILE {output.dup_metrics} 2> {log.out} > {log.err}
-#
-#         $CONDA_PREFIX/bin/samtools flagstat -@ {threads} {output.bam_mdup} > {output.flagstat_filtered}
-#         """
-
-
-# multiQC aligned bams
-rule multiQC_bam:
-    input:
-        flagstat_filtered = expand(os.path.join("02_BAM/flagstat/", ''.join(["{sample}_mapq", str(config["MAPQ_threshold"]), "_sorted_woMT_flagstat.txt"])), sample = SAMPLENAMES)
-    output:
-        multiqc_bam_report = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.html",
-    params:
-        out_directory = "03_quality_controls/multiQC_bam_filtered/",
-        multiqc_bam_report_name = "multiQC_bam_filtered.html"
-    log:
-        out = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.out",
-        err = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.err"
-    threads:
-        max(math.floor(workflow.cores/len(SAMPLENAMES)), 1)
-    benchmark:
-        "benchmarks/multiQC_bam/multiQC_bam---benchmark.txt"
-    shell:
-        """
-        printf '\033[1;36mPerforming multiQC on filtered bam flagstat/picard...\\n\033[0m'
-
-        mkdir -p {params.out_directory}
-
-        $CONDA_PREFIX/bin/multiqc -f \
-        -o {params.out_directory} \
-        -n {params.multiqc_bam_report_name} \
-        --dirs 02_BAM/flagstat > {log.err} 2> {log.out}
-        """
-
-
-
-# fastQC on fastq raw data ----------------------------------------------------------------------------------------
+# fastQC on trimmed fastq ---------------------------------------------------------------------------
 rule fastQC_trimmed_fastq:
     input:
-        fastq_trimm = expand(os.path.join("01_trimmed_fastq", "".join(["{runs}_trimmed.fastq.gz"])), runs = RUNNAMES)
+        fastq_trimm = os.path.join("01_trimmed_fastq", "{RUNS}_trimmed.fastq.gz")
     output:
-        fastqc_html = expand(os.path.join("03_quality_controls/trimmed_fastq_fastqc","{runs}_trimmed_fastqc.html"), runs = RUNNAMES),
-        fastqc_zip = expand(os.path.join("03_quality_controls/trimmed_fastq_fastqc","{runs}_trimmed_fastqc.zip"), runs = RUNNAMES)
+        fastqc_html = os.path.join("03_quality_controls/trimmed_fastq_fastqc", "{RUNS}_trimmed_fastqc.html"),
+        fastqc_zip = os.path.join("03_quality_controls/trimmed_fastq_fastqc", "{RUNS}_trimmed_fastqc.zip")
+    params:
+        outdir = "03_quality_controls/trimmed_fastq_fastqc",
+        run = "{RUNS}"
     threads:
-        workflow.cores
+        split_cores(len(RUNNAMES))
     benchmark:
-        "benchmarks/fastQC_trimmed_fastq/fastQC_trimmed_fastq---benchmark.txt"
+        "benchmarks/fastQC_trimmed_fastq/fastQC_trimmed_fastq---{RUNS}_benchmark.txt"
     shell:
         """
-        printf '\033[1;36mPerforming fastQC on trimmed fastq...\\n\033[0m'
+        printf '\033[1;36m{params.run}: performing fastQC on trimmed fastq...\\n\033[0m'
 
-        mkdir -p 03_quality_controls/trimmed_fastq_fastqc
-        $CONDA_PREFIX/bin/fastqc -t {threads} --outdir 03_quality_controls/trimmed_fastq_fastqc 01_trimmed_fastq/*_trimmed.fastq.gz
+        mkdir -p {params.outdir}
+
+        # the file to process is taken from the rule input rather than from a wildcard glob:
+        # a glob would also pick up leftovers of previous runs made with a different sample set
+        $CONDA_PREFIX/bin/fastqc -t {threads} --outdir {params.outdir} {input.fastq_trimm}
         """
-
 
 
 rule multiQC_trimmed_fastq:
     input:
-        fastqc_zip = expand(os.path.join("03_quality_controls/trimmed_fastq_fastqc","{runs}_trimmed_fastqc.zip"), runs = RUNNAMES)
+        fastqc_zip = expand(os.path.join("03_quality_controls/trimmed_fastq_fastqc", "{runs}_trimmed_fastqc.zip"), runs = RUNNAMES)
     output:
         multiqc_fastqc_report = "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.html"
     params:
-        fastqc_zip_dir = os.path.join(home_dir, "03_quality_controls/trimmed_fastq_fastqc/"),
-        out_directory = os.path.join(home_dir, "03_quality_controls/trimmed_fastq_multiQC/"),
-        home_dir = home_dir,
-        cutadapt_logs = os.path.join(home_dir, "01_trimmed_fastq/logs/"),
+        fastqc_zip_dir = "03_quality_controls/trimmed_fastq_fastqc/",
+        out_directory = "03_quality_controls/trimmed_fastq_multiQC/",
+        cutadapt_logs = "01_trimmed_fastq/logs/",
         multiqc_fastqc_report_name = "multiQC_report_trimmed_fastq.html"
     log:
-        out = os.path.join(home_dir, "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.out"),
-        err = os.path.join(home_dir, "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.err")
+        out = "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.out",
+        err = "03_quality_controls/trimmed_fastq_multiQC/multiQC_report_trimmed_fastq.err"
     threads: 1
     benchmark:
         "benchmarks/multiQC_trimmed_fastq/multiQC_trimmed_fastq---benchmark.txt"
     shell:
         """
-        printf '\033[1;36mPerforming multiQC of trimmed fastq...\\n\033[0m'
         printf '\033[1;36mGenerating multiQC report for trimmed fastq...\\n\033[0m'
 
-        cd {params.fastqc_zip_dir}
+        mkdir -p {params.out_directory}
 
         $CONDA_PREFIX/bin/multiqc -f \
         -o {params.out_directory} \
         -n {params.multiqc_fastqc_report_name} \
-        --dirs-depth 2 \
-        --dirs ./ {params.cutadapt_logs} > {log.err} 2> {log.out}
-
-        cd {params.home_dir}
+        --dirs \
+        {params.fastqc_zip_dir} \
+        {params.cutadapt_logs} > {log.out} 2> {log.err}
         """
+# --------------------------------------------------------------------------------------------------
+
+
+# multiQC aligned bams -------------------------------------------------------------------------------
+rule multiQC_bam:
+    input:
+        flagstat_filtered = expand(os.path.join("02_BAM/flagstat/", ''.join(["{sample}_mapq", MAPQ, "_sorted_woMT_flagstat.txt"])), sample = SAMPLENAMES)
+    output:
+        multiqc_bam_report = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.html"
+    params:
+        out_directory = "03_quality_controls/multiQC_bam_filtered/",
+        flagstat_dir = "02_BAM/flagstat/",
+        bowtie2_summary_dir = "02_BAM/bowtie2_aln_summary/",
+        multiqc_bam_report_name = "multiQC_bam_filtered.html"
+    log:
+        out = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.out",
+        err = "03_quality_controls/multiQC_bam_filtered/multiQC_bam_filtered.err"
+    threads: 1
+    benchmark:
+        "benchmarks/multiQC_bam/multiQC_bam---benchmark.txt"
+    shell:
+        """
+        printf '\033[1;36mPerforming multiQC on filtered bam flagstat and alignment summaries...\\n\033[0m'
+
+        mkdir -p {params.out_directory}
+
+        # the bowtie2 summaries are parsed as well, otherwise the alignment rates never reach
+        # the report
+        $CONDA_PREFIX/bin/multiqc -f \
+        -o {params.out_directory} \
+        -n {params.multiqc_bam_report_name} \
+        --dirs \
+        {params.flagstat_dir} \
+        {params.bowtie2_summary_dir} > {log.out} 2> {log.err}
+        """
+# --------------------------------------------------------------------------------------------------
+
 
 # ------------------------------------------------------------------------------
 #                                 END pipeline

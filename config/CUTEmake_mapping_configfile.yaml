@@ -1,6 +1,6 @@
-# This .yaml cofinguration file contains all variables used by the snakemake pipeline
-# DO NOT CHANGE parameter names without changing it in Snakefile as well
-# On the other hand, some parameter values have to be inevitably modifed
+# This .yaml configuration file contains all variables used by the snakemake pipeline
+# DO NOT CHANGE parameter names without changing it in the Snakefile as well
+# On the other hand, some parameter values have to be inevitably modified
 # **********************************************************************************************************************************
 
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ DNA MAPPING @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -10,6 +10,11 @@ fastq_directory:
 output_directory:
 genome_fasta:
 bowtie2_idx_prefix:
+
+# fastq_suffix must absorb everything that follows the read tag, including the Illumina
+# lane/chunk field when present. For a file called 'sampleA_R1_001.fastq.gz' the correct
+# combination is fastq_suffix: "_001.fastq.gz" and read_suffix: ['_R1', '_R2'].
+# The workflow stops with an explicit message if the two do not reconstruct the file names.
 fastq_suffix: ".fastq.gz"
 read_suffix: ['_R1', '_R2']
 
@@ -21,6 +26,16 @@ rv_adapter_sequence: "CTGTCTCTTATACACATCT"
 run_fastq_qc: True
 
 
-### 2. BAM filtering
+### 2. Alignment
+# bowtie2_maxFragmentLength caps the insert size accepted by bowtie2 (-X). Fragments longer
+# than this value are never reported, so keep it consistent with the fragment size range you
+# expect to inspect in the analyses workflow.
+bowtie2_minFragmentLength: 10
+bowtie2_maxFragmentLength: 700
+bowtie2_extra_parameters: ''
+
+
+### 3. BAM filtering
 MAPQ_threshold: 30
-remove_other_chromosomes_pattern: "CMV|HBV|HTLV|HPV|SV40|MCV|KSHV|chrUn|random|HCV|HIV|EBV"
+keep_only_proper_pairs: True
+remove_other_chromosomes_pattern: "^CMV|^HBV|^HTLV|^HPV|^SV40|^MCV|^KSHV|^chrUn|random|^HCV|^HIV|EBV"
