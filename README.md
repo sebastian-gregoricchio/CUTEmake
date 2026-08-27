@@ -36,7 +36,7 @@ DOI: <a href="https://doi.org/XYZ">XYZ</a>
 <br/><br/>
 
 ## Documentation [<img src="https://raw.githubusercontent.com/sebastian-gregoricchio/sebastian-gregoricchio.github.io/main/generic_resources/documentation.svg" align="right" height = 150/>](https://github.com/sebastian-gregoricchio/CUTEmake/wiki)
-Details on the [installation](https://github.com/sebastian-gregoricchio/CUTEmake/wiki/02.-Installation-and-dependencies) and [usage](https://github.com/sebastian-gregoricchio/CUTEmake/wiki/) of `CUTEmake` can be found at the dedicated [Wiki](https://github.com/sebastian-gregoricchio/CUTEmake/wiki/).
+Details on the installation and usage of `CUTEmake` can be found at the dedicated [Wiki](https://github.com/sebastian-gregoricchio/CUTEmake/wiki/).
 
 <br/><br/>
 
